@@ -295,7 +295,30 @@ func parseHttpResponse[T any](resp *http.Response, err error) MikrotikApiRespons
 	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
 		return errToApiResponse[T](resp.StatusCode, "unknown error, unparsable response", err)
 	} else {
+		if apiErr.Details == "" {
+			apiErr.Details = authErrorHint(resp)
+		}
 		return MikrotikApiResponse[T]{Status: MikrotikApiStatusError, Code: resp.StatusCode, Error: &apiErr}
+	}
+}
+
+// authErrorHint returns an actionable explanation for authentication failures, as RouterOS
+// only answers with a bare "Unauthorized"/"Forbidden" message without further details.
+func authErrorHint(resp *http.Response) string {
+	host := "the Mikrotik API"
+	if resp.Request != nil && resp.Request.URL != nil {
+		host = resp.Request.URL.Host
+	}
+
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		return fmt.Sprintf("authentication rejected by %s, verify api_user and api_password "+
+			"(note: '$' in the config file is expanded as an environment variable, escape it as '$$')", host)
+	case http.StatusForbidden:
+		return fmt.Sprintf("access denied by %s, verify that the group of api_user grants the "+
+			"read, write and rest-api policies", host)
+	default:
+		return ""
 	}
 }
 
