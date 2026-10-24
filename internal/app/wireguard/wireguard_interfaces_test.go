@@ -298,3 +298,70 @@ func TestManager_ImportNewInterfaces_SkipsFailingBackend(t *testing.T) {
 	assert.Equal(t, 0, imported)
 	assert.Equal(t, 1, healthy.calls, "the healthy backend must still be queried")
 }
+
+type unreachableController struct {
+	mockController
+}
+
+func (f *unreachableController) GetInterface(_ context.Context, _ domain.InterfaceIdentifier) (
+	*domain.PhysicalInterface,
+	error,
+) {
+	return nil, errors.New("API error 401: Unauthorized")
+}
+
+func (f *unreachableController) SaveInterface(
+	_ context.Context,
+	_ domain.InterfaceIdentifier,
+	_ func(pi *domain.PhysicalInterface) (*domain.PhysicalInterface, error),
+) error {
+	return errors.New("API error 401: Unauthorized")
+}
+
+type countingSaveController struct {
+	mockController
+	savedInterfaces []domain.InterfaceIdentifier
+}
+
+func (f *countingSaveController) SaveInterface(
+	ctx context.Context,
+	id domain.InterfaceIdentifier,
+	updateFunc func(pi *domain.PhysicalInterface) (*domain.PhysicalInterface, error),
+) error {
+	f.savedInterfaces = append(f.savedInterfaces, id)
+	return f.mockController.SaveInterface(ctx, id, updateFunc)
+}
+
+func TestManager_RestoreInterfaceState_ContinuesAfterFailingInterface(t *testing.T) {
+	healthy := &countingSaveController{}
+	m := Manager{
+		cfg: &config.Config{},
+		bus: &mockBus{},
+		db: &mockDB{
+			interfaces: []domain.Interface{
+				{Identifier: "wg_mt", Type: domain.InterfaceTypeServer, Backend: "mikrotik"},
+				{Identifier: "wg_local", Type: domain.InterfaceTypeServer, Backend: config.LocalBackendName},
+			},
+		},
+		wg: &ControllerManager{
+			controllers: map[domain.InterfaceBackend]backendInstance{
+				"mikrotik": {
+					Config:         config.BackendBase{Id: "mikrotik"},
+					Implementation: &unreachableController{},
+				},
+				config.LocalBackendName: {
+					Config:         config.BackendBase{Id: config.LocalBackendName},
+					Implementation: healthy,
+				},
+			},
+		},
+	}
+	ctx := domain.SetUserInfo(context.Background(), domain.SystemAdminContextUserInfo())
+
+	err := m.RestoreInterfaceState(ctx, false)
+
+	assert.ErrorContains(t, err, "wg_mt")
+	assert.NotContains(t, err.Error(), "wg_local")
+	assert.Contains(t, healthy.savedInterfaces, domain.InterfaceIdentifier("wg_local"),
+		"interfaces after a failing one must still be restored")
+}
