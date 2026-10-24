@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -251,4 +252,49 @@ func TestManager_GetUserInterfaces_Filtering(t *testing.T) {
 			assert.Equal(t, domain.InterfaceIdentifier("wg_public"), ifaces[0].Identifier)
 		}
 	})
+}
+
+type failingInterfacesController struct {
+	mockController
+}
+
+func (f *failingInterfacesController) GetInterfaces(_ context.Context) ([]domain.PhysicalInterface, error) {
+	return nil, errors.New("API error 401: Unauthorized")
+}
+
+type countingInterfacesController struct {
+	mockController
+	calls int
+}
+
+func (f *countingInterfacesController) GetInterfaces(_ context.Context) ([]domain.PhysicalInterface, error) {
+	f.calls++
+	return nil, nil
+}
+
+func TestManager_ImportNewInterfaces_SkipsFailingBackend(t *testing.T) {
+	healthy := &countingInterfacesController{}
+	m := Manager{
+		cfg: &config.Config{},
+		db:  &mockDB{},
+		wg: &ControllerManager{
+			controllers: map[domain.InterfaceBackend]backendInstance{
+				"mikrotik": {
+					Config:         config.BackendBase{Id: "mikrotik"},
+					Implementation: &failingInterfacesController{},
+				},
+				config.LocalBackendName: {
+					Config:         config.BackendBase{Id: config.LocalBackendName},
+					Implementation: healthy,
+				},
+			},
+		},
+	}
+	ctx := domain.SetUserInfo(context.Background(), domain.SystemAdminContextUserInfo())
+
+	imported, err := m.ImportNewInterfaces(ctx)
+
+	assert.NoError(t, err)
+	assert.Equal(t, 0, imported)
+	assert.Equal(t, 1, healthy.calls, "the healthy backend must still be queried")
 }

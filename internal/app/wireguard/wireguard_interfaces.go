@@ -123,7 +123,10 @@ func (m Manager) ImportNewInterfaces(ctx context.Context, filter ...domain.Inter
 	for _, wgBackend := range m.wg.GetAllControllers() {
 		physicalInterfaces, err := wgBackend.Implementation.GetInterfaces(ctx)
 		if err != nil {
-			return 0, err
+			// an unreachable or misconfigured backend must not prevent the import from all other backends
+			slog.Error("failed to query interfaces from backend, skipping import",
+				"backend", wgBackend.Config.Id, "error", err)
+			continue
 		}
 
 		for _, physicalInterface := range physicalInterfaces {
