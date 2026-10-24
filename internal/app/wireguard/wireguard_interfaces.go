@@ -123,7 +123,10 @@ func (m Manager) ImportNewInterfaces(ctx context.Context, filter ...domain.Inter
 	for _, wgBackend := range m.wg.GetAllControllers() {
 		physicalInterfaces, err := wgBackend.Implementation.GetInterfaces(ctx)
 		if err != nil {
-			return 0, err
+			// an unreachable or misconfigured backend must not prevent the import from all other backends
+			slog.Error("failed to query interfaces from backend, skipping import",
+				"backend", wgBackend.Config.Id, "error", err)
+			continue
 		}
 
 		for _, physicalInterface := range physicalInterfaces {
@@ -215,121 +218,134 @@ func (m Manager) RestoreInterfaceState(
 		return err
 	}
 
+	var restoreErrors []error
 	for _, iface := range interfaces {
 		if len(filter) != 0 && !slices.Contains(filter, iface.Identifier) {
 			continue // ignore filtered interface
 		}
 
-		peers, err := m.db.GetInterfacePeers(ctx, iface.Identifier)
-		if err != nil {
-			return fmt.Errorf("failed to load peers for %s: %w", iface.Identifier, err)
+		if err := m.restoreInterface(ctx, iface, updateDbOnError); err != nil {
+			// a failing interface (e.g. on an unreachable backend) must not prevent restoring all others
+			slog.Error("failed to restore interface state", "interface", iface.Identifier,
+				"backend", iface.Backend, "error", err)
+			restoreErrors = append(restoreErrors, err)
 		}
+	}
 
-		controller := m.wg.GetController(iface)
+	return errors.Join(restoreErrors...)
+}
 
-		_, err = controller.GetInterface(ctx, iface.Identifier)
-		if err != nil && !iface.IsDisabled() {
-			slog.Debug("creating missing interface", "interface", iface.Identifier, "backend", controller.GetId())
+// restoreInterface restores the state of a single physical interface and its peers.
+func (m Manager) restoreInterface(ctx context.Context, iface domain.Interface, updateDbOnError bool) error {
+	peers, err := m.db.GetInterfacePeers(ctx, iface.Identifier)
+	if err != nil {
+		return fmt.Errorf("failed to load peers for %s: %w", iface.Identifier, err)
+	}
 
-			// temporarily disable interface in database so that the current state is reflected correctly
-			_ = m.db.SaveInterface(ctx, iface.Identifier,
-				func(in *domain.Interface) (*domain.Interface, error) {
-					now := time.Now()
-					in.Disabled = &now // set
-					in.DisabledReason = domain.DisabledReasonInterfaceMissing
-					return in, nil
-				})
+	controller := m.wg.GetController(iface)
 
-			// try to create a new interface
-			_, err = m.saveInterface(ctx, &iface)
-			if err != nil {
-				if updateDbOnError {
-					// disable interface in database as no physical interface exists
-					_ = m.db.SaveInterface(ctx, iface.Identifier,
-						func(in *domain.Interface) (*domain.Interface, error) {
+	_, err = controller.GetInterface(ctx, iface.Identifier)
+	if err != nil && !iface.IsDisabled() {
+		slog.Debug("creating missing interface", "interface", iface.Identifier, "backend", controller.GetId())
+
+		// temporarily disable interface in database so that the current state is reflected correctly
+		_ = m.db.SaveInterface(ctx, iface.Identifier,
+			func(in *domain.Interface) (*domain.Interface, error) {
+				now := time.Now()
+				in.Disabled = &now // set
+				in.DisabledReason = domain.DisabledReasonInterfaceMissing
+				return in, nil
+			})
+
+		// try to create a new interface
+		_, err = m.saveInterface(ctx, &iface)
+		if err != nil {
+			if updateDbOnError {
+				// disable interface in database as no physical interface exists
+				_ = m.db.SaveInterface(ctx, iface.Identifier,
+					func(in *domain.Interface) (*domain.Interface, error) {
+						now := time.Now()
+						in.Disabled = &now // set
+						in.DisabledReason = domain.DisabledReasonInterfaceMissing
+						return in, nil
+					})
+			}
+			return fmt.Errorf("failed to create physical interface %s: %w", iface.Identifier, err)
+		}
+	} else {
+		slog.Debug("restoring interface state",
+			"interface", iface.Identifier, "disabled", iface.IsDisabled(), "backend", controller.GetId())
+
+		// try to move interface to stored state
+		_, err = m.saveInterface(ctx, &iface)
+		if err != nil {
+			if updateDbOnError {
+				// disable interface in database as no physical interface is available
+				_ = m.db.SaveInterface(ctx, iface.Identifier,
+					func(in *domain.Interface) (*domain.Interface, error) {
+						if iface.IsDisabled() {
 							now := time.Now()
 							in.Disabled = &now // set
 							in.DisabledReason = domain.DisabledReasonInterfaceMissing
-							return in, nil
-						})
-				}
-				return fmt.Errorf("failed to create physical interface %s: %w", iface.Identifier, err)
-			}
-		} else {
-			slog.Debug("restoring interface state",
-				"interface", iface.Identifier, "disabled", iface.IsDisabled(), "backend", controller.GetId())
-
-			// try to move interface to stored state
-			_, err = m.saveInterface(ctx, &iface)
-			if err != nil {
-				if updateDbOnError {
-					// disable interface in database as no physical interface is available
-					_ = m.db.SaveInterface(ctx, iface.Identifier,
-						func(in *domain.Interface) (*domain.Interface, error) {
-							if iface.IsDisabled() {
-								now := time.Now()
-								in.Disabled = &now // set
-								in.DisabledReason = domain.DisabledReasonInterfaceMissing
-							} else {
-								in.Disabled = nil
-								in.DisabledReason = ""
-							}
-							return in, nil
-						})
-				}
-				return fmt.Errorf("failed to change physical interface state for %s: %w", iface.Identifier, err)
-			}
-		}
-
-		// restore peers
-		for _, peer := range peers {
-			switch {
-			case iface.IsDisabled() && iface.Backend == config.LocalBackendName: // if interface is disabled, delete all peers
-				if err := controller.DeletePeer(ctx, iface.Identifier,
-					peer.Identifier); err != nil {
-					return fmt.Errorf("failed to remove peer %s for disabled interface %s: %w",
-						peer.Identifier, iface.Identifier, err)
-				}
-			default: // update peer
-				err := controller.SavePeer(ctx, iface.Identifier, peer.Identifier,
-					func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
-						domain.MergeToPhysicalPeer(pp, &peer)
-						return pp, nil
+						} else {
+							in.Disabled = nil
+							in.DisabledReason = ""
+						}
+						return in, nil
 					})
-				if err != nil {
-					return fmt.Errorf("failed to create/update physical peer %s for interface %s: %w",
-						peer.Identifier, iface.Identifier, err)
-				}
+			}
+			return fmt.Errorf("failed to change physical interface state for %s: %w", iface.Identifier, err)
+		}
+	}
+
+	// restore peers
+	for _, peer := range peers {
+		switch {
+		case iface.IsDisabled() && iface.Backend == config.LocalBackendName: // if interface is disabled, delete all peers
+			if err := controller.DeletePeer(ctx, iface.Identifier,
+				peer.Identifier); err != nil {
+				return fmt.Errorf("failed to remove peer %s for disabled interface %s: %w",
+					peer.Identifier, iface.Identifier, err)
+			}
+		default: // update peer
+			err := controller.SavePeer(ctx, iface.Identifier, peer.Identifier,
+				func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
+					domain.MergeToPhysicalPeer(pp, &peer)
+					return pp, nil
+				})
+			if err != nil {
+				return fmt.Errorf("failed to create/update physical peer %s for interface %s: %w",
+					peer.Identifier, iface.Identifier, err)
 			}
 		}
+	}
 
-		// remove non-wgportal peers
-		physicalPeers, _ := controller.GetPeers(ctx, iface.Identifier)
-		for _, physicalPeer := range physicalPeers {
-			isWgPortalPeer := false
-			for i := range peers {
-				if peers[i].Identifier == domain.PeerIdentifier(physicalPeer.PublicKey) {
-					isWgPortalPeer = true
+	// remove non-wgportal peers
+	physicalPeers, _ := controller.GetPeers(ctx, iface.Identifier)
+	for _, physicalPeer := range physicalPeers {
+		isWgPortalPeer := false
+		for i := range peers {
+			if peers[i].Identifier == domain.PeerIdentifier(physicalPeer.PublicKey) {
+				isWgPortalPeer = true
 
-					// Sync IsDynamic flag if it was changed on the backend
-					physConverted := domain.ConvertPhysicalPeer(&physicalPeer)
-					if peers[i].IsDynamic != physConverted.IsDynamic {
-						peers[i].IsDynamic = physConverted.IsDynamic
-						_ = m.db.SavePeer(ctx, peers[i].Identifier, func(p *domain.Peer) (*domain.Peer, error) {
-							p.IsDynamic = physConverted.IsDynamic
-							return p, nil
-						})
-					}
-					break
+				// Sync IsDynamic flag if it was changed on the backend
+				physConverted := domain.ConvertPhysicalPeer(&physicalPeer)
+				if peers[i].IsDynamic != physConverted.IsDynamic {
+					peers[i].IsDynamic = physConverted.IsDynamic
+					_ = m.db.SavePeer(ctx, peers[i].Identifier, func(p *domain.Peer) (*domain.Peer, error) {
+						p.IsDynamic = physConverted.IsDynamic
+						return p, nil
+					})
 				}
+				break
 			}
-			if !isWgPortalPeer {
-				err := controller.DeletePeer(ctx, iface.Identifier,
-					domain.PeerIdentifier(physicalPeer.PublicKey))
-				if err != nil {
-					return fmt.Errorf("failed to remove non-wgportal peer %s from interface %s: %w",
-						physicalPeer.PublicKey, iface.Identifier, err)
-				}
+		}
+		if !isWgPortalPeer {
+			err := controller.DeletePeer(ctx, iface.Identifier,
+				domain.PeerIdentifier(physicalPeer.PublicKey))
+			if err != nil {
+				return fmt.Errorf("failed to remove non-wgportal peer %s from interface %s: %w",
+					physicalPeer.PublicKey, iface.Identifier, err)
 			}
 		}
 	}

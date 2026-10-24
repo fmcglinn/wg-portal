@@ -97,7 +97,9 @@ func (a *App) restoreInterfaceState(ctx context.Context) error {
 
 	err := a.wg.RestoreInterfaceState(ctx, true)
 	if err != nil {
-		return err
+		// failures are reported per interface, they must not prevent wg-portal from starting up
+		slog.Warn("interface state restored with errors, affected interfaces are unavailable until fixed")
+		return nil
 	}
 
 	slog.Info("interface state restored")
